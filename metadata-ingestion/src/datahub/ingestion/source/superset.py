@@ -2,9 +2,11 @@ import json
 import logging
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import dateutil.parser as dp
 import requests
+from datahub.metadata._schema_classes import DatasetPropertiesClass, TimeStampClass
 from pydantic.class_validators import root_validator, validator
 from pydantic.fields import Field
 
@@ -18,6 +20,7 @@ from datahub.emitter.mce_builder import (
     make_dashboard_urn,
     make_dataset_urn,
     make_domain_urn,
+    make_dataset_urn_with_platform_instance,
 )
 from datahub.emitter.mcp_builder import add_domain_to_entity_wu
 from datahub.ingestion.api.common import PipelineContext
@@ -51,12 +54,16 @@ from datahub.metadata.com.linkedin.pegasus2avro.common import (
 from datahub.metadata.com.linkedin.pegasus2avro.metadata.snapshot import (
     ChartSnapshot,
     DashboardSnapshot,
+    DatasetSnapshot
 )
 from datahub.metadata.com.linkedin.pegasus2avro.mxe import MetadataChangeEvent
 from datahub.metadata.schema_classes import (
     ChartInfoClass,
     ChartTypeClass,
     DashboardInfoClass,
+    DatasetLineageTypeClass,
+    DatasetAssertionInfoClass,
+    DatasetFilterTypeClass,
 )
 from datahub.utilities import config_clean
 from datahub.utilities.registries.domain_registry import DomainRegistry
@@ -332,6 +339,83 @@ class SupersetSource(StatefulIngestionSourceBase):
         dashboard_snapshot.aspects.append(dashboard_info)
         return dashboard_snapshot
 
+    def construct_dataset_from_api_data(self, datasets_data):
+        datasets_urn = self.get_datasource_urn_from_id(datasets_data.get("id"))
+        datasets_snapshot = DatasetSnapshot(
+            urn=datasets_urn,
+            aspects=[Status(removed=False)],
+        )
+
+        modified_actor = f"urn:li:corpuser:{(datasets_data.get('changed_by') or {}).get('username', 'unknown')}"
+        modified_ts = int(
+            dp.parse(datasets_data.get("changed_on_utc", "now")).timestamp() * 1000
+        )
+        title = datasets_data.get("table_name", "")
+        last_modified = TimeStampClass(time=modified_ts, actor=modified_actor)
+
+        dataset_url = f"{self.config.display_uri}{datasets_data.get('explore_url', '')}"
+        parsed_url = urlparse(dataset_url)
+
+        if not all([parsed_url.scheme, parsed_url.netloc]):
+            logger.error(f"Invalid URI: {dataset_url}")
+            raise Exception("stop")
+        
+        # Build properties
+        custom_properties = {
+            "sql": str(datasets_data.get("sql")),
+            "schema": str(datasets_data.get("schema")),
+            "kind": str(datasets_data.get("kind")),
+            "Owners": ", ".join(
+                map(
+                    lambda owner: owner.get("username", "unknown"),
+                    datasets_data.get("owners", []),
+                )
+            ),
+            "datasource_type": str(datasets_data.get("datasource_type")),
+        }
+
+        # Create DatasetPropertiesClass object
+        dataset_properties = DatasetPropertiesClass(
+            description="",
+            name=title,
+            lastModified=last_modified,
+            customProperties=custom_properties,
+        )
+        datasets_snapshot.aspects.append(dataset_properties)
+        return datasets_snapshot
+
+    def emit_datasets_mces(self) -> Iterable[MetadataWorkUnit]:
+        current_datasets_page = 0
+        # we will set total datasets to the actual number after we get the response
+        total_datasets = PAGE_SIZE
+        while current_datasets_page * PAGE_SIZE <= total_datasets:
+            datasets_response = self.session.get(
+                f"{self.config.connect_uri}/api/v1/dataset/",
+                params=f"q=(page:{current_datasets_page},page_size:{PAGE_SIZE})",
+            )
+            if datasets_response.status_code != 200:
+                logger.warning(
+                    f"Failed to get dataset data: {datasets_response.text}"
+                )
+            datasets_response.raise_for_status()
+
+            payload = datasets_response.json()
+
+            total_datasets = payload.get("count") or 0
+
+            current_datasets_page += 1
+
+            for dataset_data in payload["result"]:
+                dataset_snapshot = self.construct_dataset_from_api_data(
+                    dataset_data
+                )
+                mce = MetadataChangeEvent(proposedSnapshot=dataset_snapshot)
+                yield MetadataWorkUnit(id=dataset_snapshot.urn, mce=mce)
+                yield from self._get_domain_wu(
+                    title=dataset_data.get("table_name", ""),
+                    entity_urn=dataset_snapshot.urn,
+                )
+
     def emit_dashboard_mces(self) -> Iterable[MetadataWorkUnit]:
         current_dashboard_page = 0
         # we will set total dashboards to the actual number after we get the response
@@ -472,6 +556,7 @@ class SupersetSource(StatefulIngestionSourceBase):
     def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         yield from self.emit_dashboard_mces()
         yield from self.emit_chart_mces()
+        yield from self.emit_datasets_mces()
 
     def get_workunit_processors(self) -> List[Optional[MetadataWorkUnitProcessor]]:
         return [
